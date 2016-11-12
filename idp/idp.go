@@ -1,7 +1,6 @@
 package idp
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -9,58 +8,62 @@ import (
 	"crypto/sha256"
 	"encoding/asn1"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"log"
 	"net"
+	"sync"
+	"time"
 )
 
 type userInternalData struct {
-	userKey    publicKey
-	userInfo   userInfo
-	sessionKey simetricKey
+	UserKey    publicKey
+	UserInfo   userInfo
+	SessionKey simetricKey
 }
 
 /*
 The type for an Identity Provider in the protocol
 */
 type identityProvider struct {
-	port      uint
-	name      string
-	publicKey publicKey
+	Port      uint
+	Name      string
+	PublicKey publicKey
 
-	users      []userInternalData
-	privateKey privateKey
+	Users      []userInternalData
+	PrivateKey privateKey
+	Control    chan bool
+	WaitGroup  *sync.WaitGroup
 }
 
 //Follows the structures for Identity Creation within the IdP
 type simetricKey struct {
-	keyData []byte
+	KeyData []byte
 }
 
 type privateKey struct {
-	keyData []byte
+	KeyData []byte
 }
 
 type publicKey struct {
-	keyData []byte
+	KeyData []byte
 }
 
 type signature struct {
-	content   []byte
-	algorithm string
-	signatute []byte
+	Content   []byte
+	Algorithm string
+	Signatute []byte
 }
 
 type ackNack struct {
-	ackNack bool
+	AckNack bool
 }
 
 const SessionInfo = 0
 const Ack = 0
 
 type messageFromIdP struct {
-	messageId uint
-	content   []byte
+	MessageId int
+	Content   []byte
 }
 
 const UserIdentity = 0
@@ -68,55 +71,70 @@ const UserInfo = 1
 const UserAuthentication = 2
 
 type messageToIdP struct {
-	messageId uint
-	content   []byte
+	MessageId int
+	Content   []byte
 }
 
 type personalInfo struct {
-	data []byte
+	Data []byte
 }
 
 type idpMessage struct {
-	messageId uint
-	content   []byte
+	MessageId int
+	Content   []byte
 }
 
 type sessionInfo struct {
-	sessionKey simetricKey
-	idp        publicKey
+	SessionKey simetricKey
+	Idp        publicKey
 }
 
 // Follows the structures for user authentication within the IdP
 type userInfo struct {
-	personalInfo    []byte
-	serviceProvider publicKey
+	PersonalInfo    []byte
+	ServiceProvider publicKey
 }
 
 // Follows a simple personalInfo for this IdP
 type personalInfoData struct {
-	name     string
-	email    string
-	age      byte
-	address  string
-	password string
+	Name     string
+	Email    string
+	Age      byte
+	Address  string
+	Password string
 }
 
 type personalInfoDataAuthentication struct {
-	email    string
-	password string
+	Email    string
+	Password string
 }
 
 /*
 Starts the Identity Provider
 */
 func (idp *identityProvider) Run() {
-	fmt.Printf("Running the IdP \"%s\" in the port %d.\n", idp.name, idp.port)
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", idp.port))
+	log.Println(fmt.Sprintf("Running the IdP \"%s\" in the port %d.", idp.Name, idp.Port))
+	defer idp.WaitGroup.Done()
+	laddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf(":%d", idp.Port))
+	if err != nil {
+		log.Fatal(err)
+	}
+	ln, err := net.ListenTCP("tcp", laddr)
+	defer ln.Close()
+	log.Println("Listening on:", laddr)
 	if err != nil {
 		log.Fatal(err)
 	}
 	for {
+		select {
+		case <-idp.Control:
+			log.Println("Stopping server on ", ln.Addr())
+			return
+		default:
+		}
 		// accept a connection
+		ln.SetDeadline(time.Now().Add(1000 * time.Millisecond))
+		log.Println("Awaiting connection")
 		c, err := ln.Accept()
 		if err != nil {
 			fmt.Println(err)
@@ -127,33 +145,45 @@ func (idp *identityProvider) Run() {
 	}
 }
 
+func (idp *identityProvider) Stop() {
+	log.Println("Stopping the server.")
+	idp.Control <- true
+	close(idp.Control)
+	idp.WaitGroup.Wait()
+}
+
 /*
 Deals with the connection to the Identity Provider.
 This is the entry point for the protocol proposed.
 */
 func (idp *identityProvider) handleConnection(c net.Conn) {
-	message, err := readFully(c)
+	log.Println("Handling connection")
+	message, err := ioutil.ReadAll(c)
 	if err != nil {
 		log.Print(err)
-		c.Close()
 		return
 	}
+	log.Println("Message received:", message)
 
 	var toIdp messageToIdP
 	asn1.Unmarshal(message, &toIdp)
-	if toIdp.messageId == UserIdentity {
+	log.Println("Message parsed:", toIdp)
+	if toIdp.MessageId == UserIdentity {
+		log.Println("Message is UserIdentity")
 		var uIdentity publicKey
-		asn1.Unmarshal(toIdp.content, &uIdentity)
-
+		asn1.Unmarshal(toIdp.Content, &uIdentity)
+		log.Println("User identity parsed:", uIdentity)
 		uid := idp.findUserInternalData(uIdentity)
 		if uid == nil {
-			new_uid := userInternalData{userKey: uIdentity}
-			idp.users = append(idp.users, new_uid)
+			log.Println("New user identity, allocating data")
+			new_uid := userInternalData{UserKey: uIdentity}
+			idp.Users = append(idp.Users, new_uid)
 			uid = &new_uid
 		}
 
-		uid.sessionKey = simetricKey{keyData: make([]byte, 256)}
-		_, err := rand.Read(uid.sessionKey.keyData)
+		uid.SessionKey = simetricKey{KeyData: make([]byte, 256)}
+		_, err := rand.Read(uid.SessionKey.KeyData)
+		log.Println("Generated Session Key")
 		if err != nil {
 			log.Print(err)
 			c.Close()
@@ -162,24 +192,27 @@ func (idp *identityProvider) handleConnection(c net.Conn) {
 		idp.sendSession(uid, c)
 	}
 
-	if toIdp.messageId == UserInfo {
+	if toIdp.MessageId == UserInfo {
+		log.Println("Message is UserInfo")
 		var uInfo userInfo
-		asn1.Unmarshal(toIdp.content, &uInfo)
+		asn1.Unmarshal(toIdp.Content, &uInfo)
 	}
+	c.Close()
 }
 
 func (idp *identityProvider) sendSession(uid *userInternalData, c net.Conn) {
-	sInfo := sessionInfo{sessionKey: uid.sessionKey, idp: idp.publicKey}
-	signedSessionInfo := sign(sInfo, idp.privateKey)
+	sInfo := sessionInfo{SessionKey: uid.SessionKey, Idp: idp.PublicKey}
+	signedSessionInfo := sign(sInfo, idp.PrivateKey)
 
 	// The messageId is unprotected!!!
 	content, err := asn1.Marshal(signedSessionInfo)
+	log.Println("Session key encoded")
 	if err != nil {
 		log.Print(err)
-		c.Close()
+		return
 	} else {
-		mFromIdP := messageFromIdP{messageId: SessionInfo, content: content}
-		idp.sendMessageAssimetric(mFromIdP, uid.userKey, c)
+		mFromIdP := messageFromIdP{MessageId: SessionInfo, Content: content}
+		idp.sendMessageAssimetric(mFromIdP, uid.UserKey, c)
 	}
 }
 
@@ -208,7 +241,7 @@ func (idp *identityProvider) sendMessageSimetric(message interface{}, sessionKey
 		log.Print(err)
 		return
 	}
-	block, err := aes.NewCipher(sessionKey.keyData)
+	block, err := aes.NewCipher(sessionKey.KeyData)
 	if err != nil {
 		log.Print(err)
 		c.Close()
@@ -236,18 +269,18 @@ func sign(message interface{}, pKey privateKey) []byte {
 
 func (idp *identityProvider) findUserInternalData(userKey publicKey) *userInternalData {
 	var result *userInternalData
-	for _, uData := range idp.users {
-		userKeyLen := len(userKey.keyData)
-		uDataLen := len(uData.userKey.keyData)
+	for _, uData := range idp.Users {
+		userKeyLen := len(userKey.KeyData)
+		uDataLen := len(uData.UserKey.KeyData)
 
 		if userKeyLen != uDataLen {
 			continue
 		}
 
 		var equality bool
-		for i := range userKey.keyData {
+		for i := range userKey.KeyData {
 			// May be subject to timing attacks
-			equality = equality && (userKey.keyData[i] == uData.userKey.keyData[i])
+			equality = equality && (userKey.KeyData[i] == uData.UserKey.KeyData[i])
 		}
 		if equality {
 			result = &uData
@@ -257,27 +290,13 @@ func (idp *identityProvider) findUserInternalData(userKey publicKey) *userIntern
 	return result
 }
 
-func readFully(conn net.Conn) ([]byte, error) {
-	defer conn.Close()
-
-	result := bytes.NewBuffer(nil)
-	var buf [512]byte
-	for {
-		n, err := conn.Read(buf[0:])
-		result.Write(buf[0:n])
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
-	}
-	return result.Bytes(), nil
-}
-
-func RunIdP(port uint, name string) {
+func RunIdP(port uint, name string) identityProvider {
 	var my_idp identityProvider
-	my_idp.name = name
-	my_idp.port = port
-	my_idp.Run()
+	my_idp.Name = name
+	my_idp.Port = port
+	my_idp.Control = make(chan bool)
+	my_idp.WaitGroup = &sync.WaitGroup{}
+	my_idp.WaitGroup.Add(1)
+	go my_idp.Run()
+	return my_idp
 }
