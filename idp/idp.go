@@ -1,6 +1,7 @@
 package idp
 
 import (
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -11,7 +12,6 @@ import (
 	"io/ioutil"
 	"log"
 	"net"
-	"sync"
 	"time"
 )
 
@@ -19,6 +19,21 @@ type userInternalData struct {
 	UserKey    publicKey
 	UserInfo   userInfo
 	SessionKey simetricKey
+}
+
+type IdentityProviderService interface {
+	UserIdentity(userPublicKey publicKey) (sessionInfo, error)
+	UserInformation(userPublicKey publicKey, userInformation userInfo) (ackNack, error)
+}
+
+type Transporter interface {
+	Receive(message []byte) (interface{}, error)
+	Transmit(message []byte) error
+}
+
+type Server interface {
+	Listen() error
+	Stop() error
 }
 
 /*
@@ -30,9 +45,8 @@ type identityProvider struct {
 	PublicKey publicKey
 
 	Users      []userInternalData
-	PrivateKey privateKey
+	PrivateKey *rsa.PrivateKey
 	Control    chan bool
-	WaitGroup  *sync.WaitGroup
 }
 
 //Follows the structures for Identity Creation within the IdP
@@ -112,32 +126,31 @@ type personalInfoDataAuthentication struct {
 /*
 Starts the Identity Provider
 */
-func (idp *identityProvider) Run() {
-	log.Println(fmt.Sprintf("Running the IdP \"%s\" in the port %d.", idp.Name, idp.Port))
-	defer idp.WaitGroup.Done()
+func (idp *identityProvider) Listen() error {
+	log.Println(fmt.Sprintf("Starting the Identity Provider \"%s\" at the port %d.", idp.Name, idp.Port))
 	laddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf(":%d", idp.Port))
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	ln, err := net.ListenTCP("tcp", laddr)
 	defer ln.Close()
 	log.Println("Listening on:", laddr)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	for {
 		select {
 		case <-idp.Control:
 			log.Println("Stopping server on ", ln.Addr())
-			return
+			return nil
 		default:
 		}
 		// accept a connection
-		ln.SetDeadline(time.Now().Add(1000 * time.Millisecond))
-		log.Println("Awaiting connection")
+		ln.SetDeadline(time.Now().Add(100 * time.Millisecond))
+		//log.Println("Awaiting connection")
 		c, err := ln.Accept()
 		if err != nil {
-			fmt.Println(err)
+			//log.Println(err)
 			continue
 		}
 		// handle the connection
@@ -148,8 +161,6 @@ func (idp *identityProvider) Run() {
 func (idp *identityProvider) Stop() {
 	log.Println("Stopping the server.")
 	idp.Control <- true
-	close(idp.Control)
-	idp.WaitGroup.Wait()
 }
 
 /*
@@ -158,62 +169,86 @@ This is the entry point for the protocol proposed.
 */
 func (idp *identityProvider) handleConnection(c net.Conn) {
 	log.Println("Handling connection")
-	message, err := ioutil.ReadAll(c)
-	if err != nil {
-		log.Print(err)
-		return
-	}
-	log.Println("Message received:", message)
-
+	defer c.Close()
+	var uIdentity publicKey
 	var toIdp messageToIdP
-	asn1.Unmarshal(message, &toIdp)
-	log.Println("Message parsed:", toIdp)
-	if toIdp.MessageId == UserIdentity {
-		log.Println("Message is UserIdentity")
-		var uIdentity publicKey
-		asn1.Unmarshal(toIdp.Content, &uIdentity)
-		log.Println("User identity parsed:", uIdentity)
-		uid := idp.findUserInternalData(uIdentity)
-		if uid == nil {
-			log.Println("New user identity, allocating data")
-			new_uid := userInternalData{UserKey: uIdentity}
-			idp.Users = append(idp.Users, new_uid)
-			uid = &new_uid
-		}
-
-		uid.SessionKey = simetricKey{KeyData: make([]byte, 256)}
-		_, err := rand.Read(uid.SessionKey.KeyData)
-		log.Println("Generated Session Key")
-		if err != nil {
-			log.Print(err)
-			c.Close()
+	var sInfo sessionInfo
+	var err error
+	for {
+		log.Print("Reading message")
+		c.SetReadDeadline(time.Now().Add(1 * time.Second))
+		message, _ := ioutil.ReadAll(c)
+		log.Println("Message received:", message)
+		asn1.Unmarshal(message, &toIdp)
+		log.Println("Message parsed:", toIdp)
+		if toIdp.MessageId == UserIdentity {
+			log.Println("Message is UserIdentity")
+			asn1.Unmarshal(toIdp.Content, &uIdentity)
+			sInfo, err = idp.UserIdentity(uIdentity)
+			if err != nil {
+				log.Print(err)
+				return
+			}
+			signedSessionInfo, err := Sign(sInfo, idp.PrivateKey)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+			m := messageFromIdP{MessageId: SessionInfo, Content: signedSessionInfo}
+			idp.sendMessageAssimetric(m, uIdentity, c)
+		} else if toIdp.MessageId == UserInfo {
+			log.Println("Message is UserInfo")
+			if uIdentity.KeyData == nil {
+				log.Println("Wrong order of messages. Ending Connection.")
+				return
+			}
+			var uInfo userInfo
+			asn1.Unmarshal(toIdp.Content, &uInfo)
+			ack, err := idp.UserInformation(uIdentity, uInfo)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+			encodedAck, err := asn1.Marshal(ack)
+			if err != nil {
+				log.Println(err)
+				return
+			}
+			m := messageFromIdP{MessageId: Ack, Content: encodedAck}
+			idp.sendMessageSimetric(m, sInfo.SessionKey, c)
+			log.Println("Protocol executed sucessully. Ending connection.")
+			return
+		} else {
+			log.Println("Unknow message. Ending connection.")
 			return
 		}
-		idp.sendSession(uid, c)
 	}
-
-	if toIdp.MessageId == UserInfo {
-		log.Println("Message is UserInfo")
-		var uInfo userInfo
-		asn1.Unmarshal(toIdp.Content, &uInfo)
-	}
-	c.Close()
 }
 
-func (idp *identityProvider) sendSession(uid *userInternalData, c net.Conn) {
-	sInfo := sessionInfo{SessionKey: uid.SessionKey, Idp: idp.PublicKey}
-	signedSessionInfo := sign(sInfo, idp.PrivateKey)
-
-	// The messageId is unprotected!!!
-	content, err := asn1.Marshal(signedSessionInfo)
-	log.Println("Session key encoded")
-	if err != nil {
-		log.Print(err)
-		return
-	} else {
-		mFromIdP := messageFromIdP{MessageId: SessionInfo, Content: content}
-		idp.sendMessageAssimetric(mFromIdP, uid.UserKey, c)
+func (idp *identityProvider) UserIdentity(userPublicKey publicKey) (sessionInfo, error) {
+	log.Println("User identity parsed:", userPublicKey)
+	uid := idp.findUserInternalData(userPublicKey)
+	if uid == nil {
+		log.Println("New user identity, allocating data")
+		new_uid := userInternalData{UserKey: userPublicKey}
+		idp.Users = append(idp.Users, new_uid)
+		uid = &new_uid
 	}
+
+	uid.SessionKey = simetricKey{KeyData: make([]byte, 256)}
+	_, err := rand.Read(uid.SessionKey.KeyData)
+	log.Println("Generated Session Key")
+	if err != nil {
+		return sessionInfo{}, err
+	}
+
+	sInfo := sessionInfo{SessionKey: uid.SessionKey, Idp: idp.PublicKey}
+	return sInfo, nil
+}
+
+func (idp *identityProvider) UserInformation(userPublicKey publicKey, userInfo userInfo) (ackNack, error) {
+	// TODO
+	return ackNack{AckNack: true}, nil
 }
 
 func (idp *identityProvider) sendMessageAssimetric(message interface{}, pKey publicKey, c net.Conn) {
@@ -225,6 +260,7 @@ func (idp *identityProvider) sendMessageAssimetric(message interface{}, pKey pub
 	}
 
 	pubKey := parsePublicKey(pKey)
+	log.Println("MessageBytes:", messageBytes)
 	encryptedMessage, err := rsa.EncryptOAEP(sha256.New(), rand.Reader, pubKey, messageBytes, nil)
 	if err != nil {
 		log.Print(err)
@@ -258,13 +294,24 @@ func (idp *identityProvider) sendMessageSimetric(message interface{}, sessionKey
 }
 
 func parsePublicKey(pKey publicKey) *rsa.PublicKey {
-	// TODO
-	return nil
+	var resultingKey rsa.PublicKey
+	asn1.Unmarshal(pKey.KeyData, &resultingKey)
+	return &resultingKey
 }
 
-func sign(message interface{}, pKey privateKey) []byte {
-	// TODO
-	return make([]byte, 0)
+func Sign(message interface{}, pKey *rsa.PrivateKey) ([]byte, error) {
+	valueToBeSigned, _ := asn1.Marshal(message)
+	hash := crypto.SHA256
+	h := hash.New()
+	h.Write(valueToBeSigned)
+	hashed := h.Sum(nil)
+	var opts rsa.PSSOptions
+	opts.SaltLength = rsa.PSSSaltLengthAuto
+	signature, err := rsa.SignPSS(rand.Reader, pKey, hash, hashed, &opts)
+	if err != nil {
+		return make([]byte, 0), err
+	}
+	return signature, nil
 }
 
 func (idp *identityProvider) findUserInternalData(userKey publicKey) *userInternalData {
@@ -292,11 +339,19 @@ func (idp *identityProvider) findUserInternalData(userKey publicKey) *userIntern
 
 func RunIdP(port uint, name string) identityProvider {
 	var my_idp identityProvider
+
+	idp_private_key, _ := rsa.GenerateKey(rand.Reader, 2048)
+
 	my_idp.Name = name
 	my_idp.Port = port
 	my_idp.Control = make(chan bool)
-	my_idp.WaitGroup = &sync.WaitGroup{}
-	my_idp.WaitGroup.Add(1)
-	go my_idp.Run()
+	my_idp.PrivateKey = idp_private_key
+	go func() {
+		err := my_idp.Listen()
+		if err != nil {
+			log.Println(err)
+		}
+		close(my_idp.Control)
+	}()
 	return my_idp
 }

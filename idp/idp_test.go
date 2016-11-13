@@ -14,13 +14,12 @@ import (
 
 func TestRunIdP(t *testing.T) {
 	idp := RunIdP(50005, "test IdP")
+	defer idp.Stop()
 	time.Sleep(100 * time.Millisecond)
-	idp.Stop()
 }
 
 func TestFirstIteration(t *testing.T) {
 	idp := RunIdP(50005, "test IdP")
-	defer idp.Stop()
 	time.Sleep(100 * time.Millisecond)
 	raddr, err := net.ResolveTCPAddr("tcp", "localhost:50005")
 	conn, err := net.DialTCP("tcp", nil, raddr)
@@ -32,7 +31,9 @@ func TestFirstIteration(t *testing.T) {
 	defer conn.Close()
 
 	keyPair, _ := rsa.GenerateKey(rand.Reader, 2048)
-	userPublicKey, _ := asn1.Marshal(keyPair.Public())
+	//keyPair.Precompute()
+	userPublicKey, _ := asn1.Marshal(keyPair.PublicKey)
+	log.Println("Test:", userPublicKey)
 	userPKey, _ := asn1.Marshal(publicKey{KeyData: userPublicKey})
 	toIdpMessage := messageToIdP{MessageId: UserIdentity, Content: userPKey}
 	messageBytes, _ := asn1.Marshal(toIdpMessage)
@@ -50,5 +51,5 @@ func TestFirstIteration(t *testing.T) {
 		return
 	}
 	log.Println("Test:", "Response:", response)
-
+	idp.Stop()
 }
